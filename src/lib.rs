@@ -8,6 +8,15 @@ use wasm_bindgen::prelude::*;
 
 const AUDIO_SAMPLE_RATE: u32 = Apu::DEFAULT_SAMPLE_RATE as u32;
 
+fn format_rom_load_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    let lower = message.to_lowercase();
+    if lower.contains("mapper") && (lower.contains("unsupported") || lower.contains("unimplemented")) {
+        return format!("Mapper não suportado neste núcleo NES: {message}");
+    }
+    message
+}
+
 pub struct NesCore {
     deck: ControlDeck,
 }
@@ -16,7 +25,8 @@ impl NesCore {
     pub fn new(rom_data: &[u8]) -> Result<Self, String> {
         let mut deck = ControlDeck::with_config(Config::default().with_sram_dir(None));
         deck.load_rom("game", &mut Cursor::new(rom_data))
-            .map_err(|error| error.to_string())?;
+            .map_err(format_rom_load_error)?;
+        deck.clear_audio_samples();
         Ok(Self { deck })
     }
 
@@ -44,8 +54,10 @@ impl NesCore {
         }
     }
 
-    pub fn take_audio_samples(&self) -> Vec<f32> {
-        self.deck.audio_samples().to_vec()
+    pub fn take_audio_samples(&mut self) -> Vec<f32> {
+        let samples = self.deck.audio_samples().to_vec();
+        self.deck.clear_audio_samples();
+        samples
     }
 
     pub fn set_button(&mut self, button: &str, pressed: bool) -> Result<(), String> {
@@ -105,7 +117,7 @@ impl NesEmulator {
     }
 
     #[wasm_bindgen(js_name = audioSamples)]
-    pub fn audio_samples(&self) -> Vec<f32> {
+    pub fn audio_samples(&mut self) -> Vec<f32> {
         self.core.take_audio_samples()
     }
 
