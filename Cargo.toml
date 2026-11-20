@@ -2,6 +2,9 @@
 name = "emmu-nes"
 version = "0.1.0"
 edition = "2024"
+description = "Emmu NES WebAssembly core"
+repository = "https://github.com/EspetoRx/emmu-nes"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
