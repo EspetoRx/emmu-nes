@@ -8,86 +8,6 @@ use wasm_bindgen::prelude::*;
 
 const AUDIO_SAMPLE_RATE: u32 = Apu::DEFAULT_SAMPLE_RATE as u32;
 
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = console)]
-    fn log(s: &str);
-}
-
-fn nes_log(msg: &str) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        log(msg);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = msg;
-    }
-}
-
-fn log_rom_header_and_vectors(rom: &[u8]) {
-    if rom.len() < 16 {
-        nes_log(&format!(
-            "[RomInspect] ROM muito curta: {} bytes",
-            rom.len()
-        ));
-        return;
-    }
-
-    let magic = &rom[0..4];
-    let prg_16k_banks = rom[4] as usize;
-    let chr_8k_banks = rom[5] as usize;
-    let flags6 = rom[6];
-    let flags7 = rom[7];
-    let mapper_ines = ((flags7 & 0xF0) | (flags6 >> 4)) as u16;
-    let is_nes2 = (flags7 & 0x0C) == 0x08;
-    let has_trainer = (flags6 & 0x04) != 0;
-    let prg_start: usize = 16 + if has_trainer { 512 } else { 0 };
-    let prg_len: usize = prg_16k_banks * 16 * 1024;
-    let chr_start: usize = prg_start.saturating_add(prg_len);
-    let chr_len: usize = chr_8k_banks * 8 * 1024;
-
-    nes_log(&format!(
-        "[RomInspect] magic={magic:02X?} nes2={is_nes2} mapper_ines={mapper_ines} prg16k={prg_16k_banks} ({prg_len}B) chr8k={chr_8k_banks} ({chr_len}B) f6={flags6:#04X} f7={flags7:#04X} total={}",
-        rom.len()
-    ));
-
-    if prg_len > 0 && rom.len() >= prg_start + prg_len {
-        let bank_size = 16 * 1024;
-        for b in 0..prg_16k_banks {
-            let start = prg_start + b * bank_size;
-            let bank = &rom[start..start + bank_size];
-            let lo = bank[0x3FFC] as u16;
-            let hi = bank[0x3FFD] as u16;
-            let rst = (hi << 8) | lo;
-            let nonzero = bank.iter().filter(|&&x| x != 0).count();
-            nes_log(&format!(
-                "[RomInspect] PRG16K[{b}]: rst=${rst:04X} head={:02X?} end={:02X?} nonzero={nonzero}/{bank_size}",
-                &bank[0..4],
-                &bank[bank_size - 4..bank_size]
-            ));
-        }
-    }
-
-    if chr_len > 0 && rom.len() >= chr_start + chr_len {
-        let chr_bank_size = 8 * 1024;
-        for c in 0..chr_8k_banks {
-            let start = chr_start + c * chr_bank_size;
-            let bank = &rom[start..start + chr_bank_size];
-            let nonzero = bank.iter().filter(|&&x| x != 0).count();
-            if nonzero > 0 || c < 2 {
-                nes_log(&format!(
-                    "[RomInspect] CHR8K[{c}]: head={:02X?} nonzero={nonzero}/{chr_bank_size}",
-                    &bank[0..4]
-                ));
-            }
-        }
-    } else if chr_8k_banks == 0 {
-        nes_log("[RomInspect] CHR-ROM = 0 banks (usa CHR-RAM)");
-    }
-}
-
 fn format_rom_load_error(error: impl std::fmt::Display) -> String {
     let message = error.to_string();
     let lower = message.to_lowercase();
@@ -101,35 +21,16 @@ fn format_rom_load_error(error: impl std::fmt::Display) -> String {
 
 pub struct NesCore {
     deck: ControlDeck,
-    frame_counter: u32,
-    last_frame_hash: u64,
 }
 
 impl NesCore {
-    fn hash_frame(frame: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in frame.iter().step_by(16) {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
-    }
-
     pub fn new(rom_data: &[u8]) -> Result<Self, String> {
-        nes_log(&format!("[NesCore::new] rom_bytes={}", rom_data.len()));
-        log_rom_header_and_vectors(rom_data);
-
         let mut deck = ControlDeck::with_config(Config::default().with_sram_dir(None));
         deck.load_rom("game", &mut Cursor::new(rom_data))
             .map_err(format_rom_load_error)?;
-        nes_log("[NesCore::new] m57 16K fixed-last-bank ativo ($C000->last)");
 
         deck.clear_audio_samples();
-        Ok(Self {
-            deck,
-            frame_counter: 0,
-            last_frame_hash: 0,
-        })
+        Ok(Self { deck })
     }
 
     pub fn run_frame(&mut self, render_graphics: bool) -> Result<Vec<u8>, String> {
@@ -149,138 +50,8 @@ impl NesCore {
             }
         }
 
-        self.frame_counter += 1;
-
         if render_graphics {
-            let frame = self.deck.frame_buffer().to_vec();
-            let h = Self::hash_frame(&frame);
-            let changed = h != self.last_frame_hash;
-            if self.frame_counter <= 5 || changed || self.frame_counter % 120 == 0 {
-                let first_px = [frame[0], frame[1], frame[2], frame[3]];
-                let mid_idx = (frame.len() / 2) & !3;
-                let mid_px = [
-                    frame[mid_idx],
-                    frame[mid_idx + 1],
-                    frame[mid_idx + 2],
-                    frame[mid_idx + 3],
-                ];
-                let bus = self.deck.bus();
-                let pc = bus.cpu.pc;
-                let sp = bus.cpu.sp;
-                let a = bus.cpu.acc;
-                let x = bus.cpu.x;
-                let y = bus.cpu.y;
-                let open_bus = bus.ppu.open_bus;
-                let b8000 = bus.memory.prg_peek(0x8000);
-                let bc000 = bus.memory.prg_peek(0xC000);
-                let rst_lo = bus.memory.prg_peek(0xFFFC);
-                let rst_hi = bus.memory.prg_peek(0xFFFD);
-                let rst_vec = (u16::from(rst_hi) << 8) | u16::from(rst_lo);
-                let code_8000: [u8; 16] =
-                    std::array::from_fn(|i| bus.memory.prg_peek(0x8000 + i as u16));
-                nes_log(&format!(
-                    "[NesCore::code8000] f={} code={code_8000:02X?}",
-                    self.frame_counter
-                ));
-
-                let pc_window: [u8; 16] = std::array::from_fn(|i| {
-                    let offset = i as i32 - 6;
-                    let addr = (i32::from(pc) + offset).clamp(0x0000, 0xFFFF) as u16;
-                    bus.peek(addr)
-                });
-                let stack_top: [u8; 8] = std::array::from_fn(|i| {
-                    let sp_u16 = u16::from(sp.wrapping_add(1 + i as u8));
-                    bus.peek(0x0100 | sp_u16)
-                });
-                nes_log(&format!(
-                    "[NesCore::pc_dump] f={} pc=${pc:04X} (pc-6..pc+9)={pc_window:02X?} | sp=${sp:02X} stack={stack_top:02X?}",
-                    self.frame_counter
-                ));
-
-                nes_log(&format!(
-                    "[NesCore::run_frame] f={} changed={} hash={:#018X} rgba0={first_px:02X?} mid={mid_px:02X?} | pc=${pc:04X} A={a:02X} X={x:02X} Y={y:02X} ppu_bus={open_bus:#04X} $8000={b8000:02X} $C000={bc000:02X} rst=${rst_vec:04X}",
-                    self.frame_counter, changed, h
-                ));
-
-                if self.frame_counter == 1 {
-                    let fffc = bus.memory.prg_peek(0xFFFC);
-                    let fffd = bus.memory.prg_peek(0xFFFD);
-                    let ff00: [u8; 8] =
-                        std::array::from_fn(|i| bus.memory.prg_peek(0xFF00 + i as u16));
-                    nes_log(&format!(
-                        "[NesCore::vecs] fffc_d=[{:02X}, {:02X}] (${:04X}) | ff00={ff00:02X?}",
-                        fffc,
-                        fffd,
-                        (u16::from(fffd) << 8) | u16::from(fffc)
-                    ));
-                }
-                if self.frame_counter == 1 {
-                    let b830: [u8; 16] =
-                        std::array::from_fn(|i| bus.memory.prg_peek(0xB830 + i as u16));
-                    nes_log(&format!("[NesCore::b830] code={b830:02X?}"));
-                }
-                if self.frame_counter == 1 {
-                    let b890: [u8; 16] =
-                        std::array::from_fn(|i| bus.memory.prg_peek(0xB890 + i as u16));
-                    let c492: [u8; 16] =
-                        std::array::from_fn(|i| bus.memory.prg_peek(0xC492 + i as u16));
-                    nes_log(&format!(
-                        "[NesCore::b894] b890={b890:02X?} | c492={c492:02X?}"
-                    ));
-                }
-                if self.frame_counter == 1 {
-                    let ram0400: [u8; 16] =
-                        std::array::from_fn(|i| bus.memory.prg_peek(0x0400 + i as u16));
-                    let prg8518: [u8; 16] =
-                        std::array::from_fn(|i| bus.memory.prg_peek(0x8518 + i as u16));
-                    nes_log(&format!(
-                        "[NesCore::trampoline] $0400={ram0400:02X?} | $8518={prg8518:02X?}"
-                    ));
-                }
-                if self.frame_counter == 1 {
-                    let b9618: [u8; 16] =
-                        std::array::from_fn(|i| bus.memory.prg_peek(0x9618 + i as u16));
-                    nes_log(&format!("[NesCore::loop961d] $9618={b9618:02X?}"));
-                }
-
-                let last_idx = frame.len().saturating_sub(4);
-                let last_px = [
-                    frame[last_idx],
-                    frame[last_idx + 1],
-                    frame[last_idx + 2],
-                    frame[last_idx + 3],
-                ];
-                nes_log(&format!(
-                    "[NesCore::px] f={} rgba0={first_px:02X?} mid={mid_px:02X?} last={last_px:02X?}",
-                    self.frame_counter
-                ));
-
-                if self.frame_counter == 1 || self.frame_counter == 120 {
-                    let ram0220: [u8; 32] =
-                        std::array::from_fn(|i| bus.memory.prg_peek(0x0220 + i as u16));
-                    nes_log(&format!(
-                        "[NesCore::ram0220] f={} $0220..$023F={ram0220:02X?}",
-                        self.frame_counter
-                    ));
-                }
-                if self.frame_counter == 1 || self.frame_counter == 120 {
-                    let ram0220: [u8; 32] = std::array::from_fn(|i| bus.peek(0x0220 + i as u16));
-                    let ram0440: [u8; 32] = std::array::from_fn(|i| bus.peek(0x0440 + i as u16));
-                    nes_log(&format!(
-                        "[NesCore::cpu_ram] f={} pc=${pc:04X} $0220..$023F={ram0220:02X?} | $0440..$045F={ram0440:02X?}",
-                        self.frame_counter
-                    ));
-                }
-
-                for line in tetanes_core::mapper::m057_mapper57::take_m057_logs() {
-                    nes_log(&line);
-                }
-                for line in tetanes_core::mapper::m083_mapper83::take_m83_logs() {
-                    nes_log(&line);
-                }
-            }
-            self.last_frame_hash = h;
-            Ok(frame)
+            Ok(self.deck.frame_buffer().to_vec())
         } else {
             Ok(Vec::new())
         }
@@ -289,14 +60,6 @@ impl NesCore {
     pub fn take_audio_samples(&mut self) -> Vec<f32> {
         let samples = self.deck.audio_samples().to_vec();
         self.deck.clear_audio_samples();
-        if (self.frame_counter <= 5 || self.frame_counter % 60 == 0) && !samples.is_empty() {
-            let max_abs = samples.iter().fold(0.0_f32, |acc, &s| acc.max(s.abs()));
-            nes_log(&format!(
-                "[NesCore::audio] f={} count={} max_abs={max_abs:.4}",
-                self.frame_counter,
-                samples.len()
-            ));
-        }
         samples
     }
 
